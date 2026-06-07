@@ -1,62 +1,94 @@
-import logging
-import sqlite3
 import os
 import re
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import sqlite3
+import unicodedata
+import logging
+from fastapi import FastAPI, Request
+from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
 )
+
+# ================= CONFIG =================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+DB_FILE = "text_directory.db"
+
+if not BOT_TOKEN or not WEBHOOK_URL:
+    raise Exception("BOT_TOKEN or WEBHOOK_URL missing")
+
+# ================= INIT =================
+
+app = FastAPI()
+application = Application.builder().token(BOT_TOKEN).build()
+bot = application.bot
 
 logging.basicConfig(level=logging.INFO)
 
-DB_FILE = "text_directory.db"
-
-# ---------------- INIT ----------------
+# ================= DATABASE =================
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            display_category TEXT NOT NULL,
-            clean_category TEXT NOT NULL,
-            display_trigger TEXT NOT NULL,
-            clean_trigger TEXT NOT NULL,
-            message_id INTEGER NOT NULL,
-            chat_id INTEGER NOT NULL,
-            UNIQUE(clean_trigger)
-        )
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        display_category TEXT,
+        clean_category TEXT,
+        display_trigger TEXT,
+        clean_trigger TEXT UNIQUE,
+        message_id INTEGER,
+        chat_id INTEGER
+    )
     """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS category_orders (
-            clean_category TEXT PRIMARY KEY,
-            sort_weight INTEGER NOT NULL DEFAULT 100
-        )
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bot_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
     """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS bot_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    """)
-
-    # Defaults
-    cursor.execute("INSERT OR IGNORE INTO bot_settings VALUES ('hub_name','iQOO Neo 10 Hub')")
-    cursor.execute("INSERT OR IGNORE INTO bot_settings VALUES ('hub_desc','Tap a trigger to fetch files')")
-    cursor.execute("INSERT OR IGNORE INTO bot_settings VALUES ('default_category','Miscellaneous')")
+    cur.execute("INSERT OR IGNORE INTO bot_settings VALUES ('hub_name','Notes Hub')")
+    cur.execute("INSERT OR IGNORE INTO bot_settings VALUES ('hub_desc','Send #trigger to fetch notes')")
+    cur.execute("INSERT OR IGNORE INTO bot_settings VALUES ('default_category','Miscellaneous')")
 
     conn.commit()
     conn.close()
 
+# ================= NORMALIZER (CRITICAL FIX) =================
 
-# ---------------- SETTINGS ----------------
+def norm(text: str) -> str:
+    if not text:
+        return ""
 
-def get_setting(key):
+    text = unicodedata.normalize("NFKC", text)
+    text = text.strip().lower()
+
+    if text.startswith("#"):
+        text = text[1:]
+
+    # unify spaces, underscores, hyphens
+    text = re.sub(r"[\s\-]+", "_", text)
+
+    # remove invalid chars
+    text = re.sub(r"[^a-z0-9_]", "", text)
+
+    # collapse underscores
+    text = re.sub(r"_+", "_", text)
+
+    return "#" + text
+
+
+# ================= SETTINGS =================
+
+def get_setting(key: str):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT value FROM bot_settings WHERE key=?", (key,))
@@ -64,225 +96,159 @@ def get_setting(key):
     conn.close()
     return r[0] if r else ""
 
-def set_setting(key, value):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO bot_settings VALUES (?,?)", (key, value))
-    conn.commit()
-    conn.close()
+
+# ================= COMMANDS =================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 Bot is running")
 
 
-# ---------------- NORMALIZE ----------------
-
-def normalize_trigger(text: str) -> str:
-    text = text.strip().lower()
-    if not text.startswith("#"):
-        text = "#" + text
-    text = re.sub(r"[^a-z0-9_#]", "", text)
-    return text
-
-
-# ---------------- KEYBOARD ----------------
-
-def get_categories():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT clean_category
-        FROM category_orders
-        ORDER BY sort_weight ASC
-    """)
-
-    cats = [c[0] for c in cur.fetchall()]
-    conn.close()
-    return cats
-
-
-def get_keyboard(trigger: str):
-    cats = get_categories()
-    kb = []
-
-    for c in cats:
-        kb.append([InlineKeyboardButton(f"📁 {c}", callback_data=f"mv|{trigger}|{c}")])
-
-    kb.append([
-        InlineKeyboardButton("⭕ Delete", callback_data=f"del|{trigger}"),
-        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{trigger}")
-    ])
-
-    return InlineKeyboardMarkup(kb)
-
-
-# ---------------- SAVE ----------------
-
-async def save_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a message first.")
-        return
+        return await update.message.reply_text("Reply to a message first")
 
-    arg = " ".join(context.args).strip()
-    if not arg:
-        await update.message.reply_text("Use /save Category/trigger or /save trigger")
-        return
+    raw = " ".join(context.args).strip()
 
-    default_cat = get_setting("default_category")
-
-    if "/" in arg:
-        cat, trig = arg.split("/", 1)
+    if "/" in raw:
+        cat, trig = raw.split("/", 1)
     else:
-        cat, trig = default_cat, arg
+        cat = get_setting("default_category")
+        trig = raw
 
-    trig = normalize_trigger(trig)
+    clean = norm(trig)
 
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT OR REPLACE INTO notes
-        (display_category, clean_category, display_trigger, clean_trigger, message_id, chat_id)
-        VALUES (?,?,?,?,?,?)
+    INSERT OR REPLACE INTO notes
+    (display_category, clean_category, display_trigger, clean_trigger, message_id, chat_id)
+    VALUES (?, ?, ?, ?, ?, ?)
     """, (
-        cat, cat.lower(),
-        trig, trig,
+        cat,
+        cat.lower(),
+        trig,
+        clean,
         update.message.reply_to_message.message_id,
         update.message.chat_id
     ))
 
-    cur.execute("""
-        INSERT OR IGNORE INTO category_orders VALUES (?,100)
-    """, (cat.lower(),))
-
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(
-        f"📥 Saved:\n`{trig}` in {cat}",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"📥 Saved {clean}")
 
 
-# ---------------- NOTES ----------------
+# ================= NOTES LIST =================
 
 async def notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT display_category, display_trigger
-        FROM notes
-        ORDER BY clean_category ASC, clean_trigger ASC
+    SELECT display_category, display_trigger
+    FROM notes
+    ORDER BY clean_category, clean_trigger
     """)
 
     rows = cur.fetchall()
     conn.close()
 
-    hub = get_setting("hub_name")
-    desc = get_setting("hub_desc")
-
-    text = f"{hub}\n{desc}\n\n"
+    text = f"🤖 {get_setting('hub_name')}\n\n"
 
     current = None
     for cat, trig in rows:
         if cat != current:
             current = cat
-            text += f"\n{cat.upper()}\n"
+            text += f"\n📁 {cat.upper()}\n"
         text += f"• `{trig}`\n"
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text)
 
 
-# ---------------- TRIGGER FETCH ----------------
+# ================= FETCH (FIXED MULTI-WORD SUPPORT) =================
 
-async def fetch_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    trig = normalize_trigger(update.message.text)
+async def fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip()
+
+    if not text.startswith("#"):
+        return
+
+    trigger = norm(text)
 
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT chat_id, message_id
-        FROM notes
-        WHERE clean_trigger=?
-    """, (trig,))
+    SELECT chat_id, message_id
+    FROM notes
+    WHERE clean_trigger=?
+    """, (trigger,))
 
     row = cur.fetchone()
     conn.close()
 
     if row:
+        from_chat, msg_id = row
+
         await context.bot.forward_message(
             chat_id=update.effective_chat.id,
-            from_chat_id=row[0],
-            message_id=row[1]
+            from_chat_id=from_chat,
+            message_id=msg_id
         )
 
 
-# ---------------- CALLBACKS ----------------
+# ================= CALLBACK (BASIC) =================
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
-    data = q.data.split("|")
-
-    if data[0] == "mv":
-        _, trig, cat = data
-        conn = sqlite3.connect(DB_FILE)
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE notes
-            SET display_category=?, clean_category=?
-            WHERE clean_trigger=?
-        """, (cat, cat.lower(), trig))
-        conn.commit()
-        conn.close()
-
-        await q.edit_message_text(f"Moved {trig} → {cat}")
-
-    elif data[0] == "del":
-        trig = data[1]
-
-        conn = sqlite3.connect(DB_FILE)
-        cur = conn.cursor()
-        cur.execute("DELETE FROM notes WHERE clean_trigger=?", (trig,))
-        conn.commit()
-        conn.close()
-
-        await q.edit_message_text(f"Deleted {trig}")
-
-    elif data[0] == "cancel":
-        await q.edit_message_text("Cancelled")
+    await q.edit_message_text("Action received")
 
 
-# ---------------- SETTINGS ----------------
+# ================= HANDLERS =================
 
-async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_setting("hub_name", " ".join(context.args))
-    await update.message.reply_text("Updated name")
-
-async def set_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_setting("hub_desc", " ".join(context.args))
-    await update.message.reply_text("Updated description")
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("save", save))
+application.add_handler(CommandHandler("notes", notes))
+application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^#"), fetch))
+application.add_handler(CallbackQueryHandler(callback))
 
 
-# ---------------- MAIN ----------------
+# ================= WEBHOOK =================
 
-def main():
+@app.get("/health")
+async def health():
+    return {"status": "alive"}
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, bot)
+
+    await application.process_update(update)
+
+    return {"ok": True}
+
+
+# ================= STARTUP =================
+
+@app.on_event("startup")
+async def startup():
     init_db()
 
-    app = Application.builder().token(os.getenv("BOT_TOKEN")).build()
+    await application.initialize()
+    await application.start()
 
-    app.add_handler(CommandHandler("save", save_item))
-    app.add_handler(CommandHandler("notes", notes))
-    app.add_handler(CommandHandler("name", set_name))
-    app.add_handler(CommandHandler("description", set_desc))
-
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^#"), fetch_trigger))
-    app.add_handler(CallbackQueryHandler(callback))
-
-    print("Bot running...")
-    app.run_polling()
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
 
 
-if __name__ == "__main__":
-    main()
+@app.on_event("shutdown")
+async def shutdown():
+    await application.stop()
+    await application.shutdown()
